@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
+from torch import amp
 from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import v2 as T          # >=0.19
@@ -148,11 +149,12 @@ def cifar_loaders(root, bs, workers):
         T.RandomCrop(32, padding=4, padding_mode="reflect"),
         T.RandomHorizontalFlip(),
         T.RandAugment(),
+        T.PILToTensor(),
         T.ToDtype(torch.float32, scale=True),
         T.Normalize(CIFAR_MEAN, CIFAR_STD),
         T.RandomErasing(p=0.25)
     ])
-    val_t = T.Compose([T.ToDtype(torch.float32, scale=True), T.Normalize(CIFAR_MEAN, CIFAR_STD)])
+    val_t = T.Compose([T.PILToTensor(), T.ToDtype(torch.float32, scale=True), T.Normalize(CIFAR_MEAN, CIFAR_STD)])
     tr = datasets.CIFAR100(root, True, download=True, transform=train_t)
     te = datasets.CIFAR100(root, False, download=True, transform=val_t)
     tr_ld = DataLoader(tr, bs, shuffle=True, num_workers=workers, pin_memory=True, persistent_workers=True, prefetch_factor=4)
@@ -170,38 +172,46 @@ def load_pretrained(model, path):
     print(f"Loaded {path}  missing={len(msg.missing_keys)}  unexpected={len(msg.unexpected_keys)}")
 
 # ------------------------- Train ---------------------------
+# ------------------------- Train ---------------------------
 def train(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
+    random.seed(0); np.random.seed(0)
+    torch.manual_seed(0); torch.cuda.manual_seed_all(0)
 
     if args.stage == "pretrain":
-        ld_train, ld_val = imagenet_loaders(args.imagenet, args.img_size, args.bs, args.workers)
-        num_classes, args.patch, args.img_size = 1000, args.patch, args.img_size
+        # ImageNet-1k
+        ld_train, ld_val = imagenet_loaders(
+            args.imagenet, args.img_size, args.bs, args.workers)
+        num_classes = 1000
     else:
-        ld_train, ld_val = cifar_loaders(args.data, args.bs, args.workers)
-        num_classes, args.patch, args.img_size = 100, 4, 32
+        # CIFAR-100
+        args.img_size, args.patch = 32, 4
+        ld_train, ld_val = cifar_loaders(
+            args.data, args.bs, args.workers)
+        num_classes = 100
 
-    model = TinyViT(args.img_size, args.patch, args.dim, args.layers, args.heads, args.dff,
-                    num_classes, args.drop_path, args.dropout).to(device)
-    if args.compile: model = torch.compile(model)
-    if args.resume: load_pretrained(model, args.resume)
+    net = TinyViT(args.img_size, args.patch, args.dim, args.layers, args.heads, args.dff, num_classes, args.drop_path, args.dropout).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    scaler = torch.cuda.amp.GradScaler()
-    total = len(ld_train) * args.epochs
-    warm = args.warmup * len(ld_train)
-    sched = cosine_warmup(opt, warm, total, args.min_lr)
-    crit = nn.CrossEntropyLoss(label_smoothing=args.ls)
+    if args.resume:
+        load_pretrained(net, args.resume)
 
-    ema = copy.deepcopy(model).eval().to(device)
-    for p in ema.parameters(): 
+    ema = copy.deepcopy(net).eval().to(device)
+    for p in ema.parameters():
         p.requires_grad_(False)
+
+    model = torch.compile(net) if args.compile else net
+
+    opt    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    scaler = amp.GradScaler(device="cuda")
+    total  = len(ld_train) * args.epochs
+    warm   = args.warmup * len(ld_train)
+    sched  = cosine_warmup(opt, warm, total, args.min_lr)
+    crit   = nn.CrossEntropyLoss(label_smoothing=args.ls)
+
     best = 0.
+
 
     try:
         step = 0
@@ -213,7 +223,7 @@ def train(args):
                 imgs, lbls = imgs.to(device, non_blocking=True), lbls.to(device, non_blocking=True)
                 imgs, y1, y2, lam = mixup(imgs, lbls, args.mixup_alpha, args.mix_prob)
                 opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast():
+                with amp.autocast(device_type='cuda'):
                     logits = model(imgs)
                     loss = lam * crit(logits, y1) + (1 - lam) * crit(logits, y2)
                 scaler.scale(loss).backward()
@@ -260,7 +270,7 @@ def train(args):
     export_dir = Path("models")
     export_dir.mkdir(exist_ok=True)
     onnx_path = str(export_dir/"vit_model.onnx")
-    torch.onnx.export(ema,dummy,onnx_path, input_names=["images"], output_names=["logits"], opset_version=13, do_constant_folding=False)
+    torch.onnx.export(ema, dummy, onnx_path, input_names=["images"], output_names=["logits"], opset_version=13, do_constant_folding=False)
     print("ONNX exported ➜", onnx_path)
 
     try:
