@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch import amp
+from torch.optim.swa_utils import (AveragedModel, get_ema_multi_avg_fn, update_bn)
 from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import v2 as T          # >=0.19
@@ -37,29 +38,28 @@ class LayerNorm(nn.Module):
         return self.g * (x - m) / torch.sqrt(v + self.eps) + self.b
 
 class PatchEmbed(nn.Module):
-    def __init__(self,img,patch,in_c=3, d=256):
+    def __init__(self, img, patch, in_c=3, d=256):
         super().__init__()
-        self.p = patch
-        self.np = (img//patch)**2
-        self.w = nn.Parameter(torch.randn(d,in_c*patch*patch)*0.02)
-        self.b = nn.Parameter(torch.zeros(d))
+        self.proj = nn.Conv2d(in_c, d, patch, patch)  # kernel=stride=patch
+        self.np = (img // patch) ** 2
 
-    def forward(self,x): 
-        return F.linear(F.unfold(x, kernel_size=self.p, stride=self.p).transpose(1,2), self.w, self.b)
+    def forward(self, x):
+        x = self.proj(x).flatten(2).transpose(1,2)    # (B,N,d)
+        return x
 
 class MHSA(nn.Module):
-    def __init__(self,d,h):
+    def __init__(self, d, h):
         super().__init__()
         self.h = h
-        self.scale = (d//h)**-0.5
-        self.qkv = nn.Linear(d,d*3)
-        self.proj = nn.Linear(d,d)
+        self.qkv = nn.Linear(d, 3*d, bias=False)
+        self.proj = nn.Linear(d, d)
 
-    def forward(self,x):
+    def forward(self, x):
         B, T, D = x.shape
-        q, k, v = self.qkv(x).view(B, T, 3, self.h, D//self.h).permute(2, 0, 3, 1, 4)
-        y = (q @ k.transpose(-2, -1)) * self.scale
-        return self.proj((y.softmax(-1) @ v).transpose(1, 2).reshape(B, T, D))
+        qkv = self.qkv(x).view(B, T, 3, self.h, D//self.h).permute(2,0,3,1,4)
+        q, k, v = qkv.unbind(0)
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        return self.proj(y.transpose(1,2).reshape(B, T, D))
 
 class FFN(nn.Module):
     def __init__(self, d, dff, p=0.): 
@@ -165,13 +165,11 @@ def cifar_loaders(root, bs, workers):
 def load_pretrained(model, path):
     sd = torch.load(path, map_location="cpu")
     if isinstance(sd, dict) and "state_dict" in sd: sd = sd["state_dict"]
-    # elimina classificatore se dimensioni diverse
     head_w = head_b = model.head.weight.shape[0]
     sd = {k: v for k, v in sd.items() if not (k.startswith("head.") and v.shape[0] != head_w)}
     msg = model.load_state_dict(sd, strict=False)
     print(f"Loaded {path}  missing={len(msg.missing_keys)}  unexpected={len(msg.unexpected_keys)}")
 
-# ------------------------- Train ---------------------------
 # ------------------------- Train ---------------------------
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -197,14 +195,12 @@ def train(args):
     if args.resume:
         load_pretrained(net, args.resume)
 
-    ema = copy.deepcopy(net).eval().to(device)
-    for p in ema.parameters():
-        p.requires_grad_(False)
+    ema = AveragedModel(net, device=device, multi_avg_fn=get_ema_multi_avg_fn(args.ema), use_buffers=True)
 
-    model = torch.compile(net) if args.compile else net
+    model = torch.compile(net, mode="max-autotune") if args.compile else net
 
     opt    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    scaler = amp.GradScaler(device="cuda")
+    scaler = amp.GradScaler()
     total  = len(ld_train) * args.epochs
     warm   = args.warmup * len(ld_train)
     sched  = cosine_warmup(opt, warm, total, args.min_lr)
@@ -212,6 +208,25 @@ def train(args):
 
     best = 0.
 
+    # --------------------- Print model summary ---------------------
+    PARAMS = [p for p in model.parameters()]
+
+    tot_elems = sum(p.numel() for p in PARAMS)
+    print(f"Parameters: {tot_elems:,}")
+
+    def to_mib(bytes_): return bytes_ / 1024**2
+
+    fp32_bytes = sum(p.numel() * 4 for p in PARAMS)
+    print(f"Memory fp32 (ass.): {to_mib(fp32_bytes):.2f} MiB")
+
+    dtype_bytes = sum(p.numel() * p.element_size() for p in PARAMS)
+    print(f"Memory actual dtype: {to_mib(dtype_bytes):.2f} MiB")
+
+    int8_bytes = sum(p.numel() * 1 for p in PARAMS)
+    print(f"Memory int8 (quant): {to_mib(int8_bytes):.2f} MiB")
+
+    print("Model compiled:", args.compile)
+    print("Using mixed precision:", torch.cuda.is_available())
 
     try:
         step = 0
@@ -229,16 +244,16 @@ def train(args):
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
+                ema.update_parameters(model)
                 sched.step()
                 step += 1
 
-                with torch.no_grad():
-                    for pe, p in zip(ema.parameters(), model.parameters()):
-                        pe.lerp_(p, 1 - args.ema)
-
                 loss_sum += loss.item() * imgs.size(0)
-                correct += (logits.argmax(1) == lbls).sum().item()
-                tot += imgs.size(0)
+                # Only count accuracy for unmixed samples (lam == 1)
+                if lam == 1.0:
+                    correct += (logits.argmax(1) == y1).sum().item()
+                    tot += imgs.size(0)
+                # Otherwise, skip accuracy computation for mixed samples
 
             train_loss, train_acc = loss_sum / tot, 100 * correct / tot
             ema.eval()
@@ -255,22 +270,26 @@ def train(args):
                   f"time {time.time()-t0:.1f}s")
             if val_acc > best:
                 best = val_acc
-                Path("checkpoints").mkdir(exist_ok=True)
-                name = "best_tvit_imnet.pth" if args.stage == "pretrain" else "best_tvit_cifar.pth"
-                torch.save(ema.state_dict(), f"checkpoints/{name}")
     except KeyboardInterrupt:
-        torch.save(ema.state_dict(),"checkpoints/interrupted.pth")
+        Path("checkpoints").mkdir(exist_ok=True)
+        torch.save(ema.module.state_dict(), "checkpoints/interrupted.pth")
         print("Interrupted, model saved.")
     finally: 
         print(f"Best val acc: {best:.2f}%")
+        print("Interrupted, model saved.")
 
-    # ----------- Export ONNX + YAML (identico) ----------------
-    ema.eval()
-    dummy = torch.randn(1,3,args.img_size,args.img_size).to(device)
+    # ----------- Export ONNX + YAML ----------------
     export_dir = Path("models")
     export_dir.mkdir(exist_ok=True)
     onnx_path = str(export_dir/"vit_model.onnx")
-    torch.onnx.export(ema, dummy, onnx_path, input_names=["images"], output_names=["logits"], opset_version=13, do_constant_folding=False)
+    base = ema.module if isinstance(ema, AveragedModel) else ema
+    base.eval()
+    dummy = torch.randn(1,3,args.img_size,args.img_size).to(device)
+    torch.onnx.export(base, dummy, onnx_path,
+                     input_names=["images"], output_names=["logits"],
+                     opset_version=17,
+                     do_constant_folding=False)
+
     print("ONNX exported ➜", onnx_path)
 
     try:
@@ -289,20 +308,34 @@ def train(args):
                 layers = (layers or 0) + 1
             elif n == "head.weight":
                 out_dim = init.dims[0]
-        cfg = dict(DMODEL=d_model or args.dim, DFF=d_ff or args.dff, HEADS=args.heads,
-                   TOKENS=ema.embed.np + 1, LAYERS=layers or args.layers, OUT_DIM=out_dim or num_classes,
-                   EPS_SHIFT=12, shifts={}, PATCHES=ema.embed.np, PATCH_DIM=ema.embed.w.shape[1])
+        # Set defaults if values are still None
+        if d_ff is None:
+            d_ff = args.dff
+        if out_dim is None:
+            out_dim = num_classes
+        if layers is None:
+            layers = args.layers
+        cfg = dict(DMODEL=d_model, 
+                   DFF=d_ff, 
+                   HEADS=args.heads,
+                   TOKENS=base.embed.np + 1, 
+                   LAYERS=layers, 
+                   OUT_DIM=out_dim,
+                   EPS_SHIFT=12, 
+                   shifts={}, 
+                   PATCHES=base.embed.np, 
+                   PATCH_DIM=base.embed.proj.weight.shape[0])
         with open(export_dir / "vit_config.yaml", "w") as fh:
             yaml.safe_dump(cfg, fh, sort_keys=False)
         print("YAML exported ➜", export_dir / "vit_config.yaml")
-    except ImportError as e:
+    except Exception as e:
         print("Skip YAML export:", e)
 
 # --------------------------- CLI ---------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser("Tiny ViT train (ImageNet➜CIFAR)")
     p.add_argument("--stage", choices=["pretrain", "finetune"], default="finetune")
-    p.add_argument("--data", default="./data", help="root CIFAR‑100")
+    p.add_argument("--data", default="./data", help="root CIFAR-100")
     p.add_argument("--imagenet", default="./imagenet", help="root ImageNet train/ val/")
     p.add_argument("--img_size", type=int, default=224, help="input res (pretrain)")
     p.add_argument("--patch", type=int, default=16, help="patch size (pretrain)")
@@ -328,9 +361,9 @@ if __name__ == "__main__":
     # ema
     p.add_argument("--ema", type=float, default=0.9999)
     # misc
-    p.add_argument("--workers", type=int, default=os.cpu_count()-2)
+    p.add_argument("--workers", type=int, default=max(1, os.cpu_count()-2))
     p.add_argument("--compile", action="store_true")
-    p.add_argument("--resume", help="checkpoint .pth to resume / fine‑tune")
+    p.add_argument("--resume", help="checkpoint .pth to resume / fine-tune")
     args = p.parse_args()
 
     # set defaults for CIFAR stage
