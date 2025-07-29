@@ -228,6 +228,8 @@ def train(args):
     print("Model compiled:", args.compile)
     print("Using mixed precision:", torch.cuda.is_available())
 
+    Path("checkpoints").mkdir(exist_ok=True)
+
     try:
         step = 0
         for epoch in range(1, args.epochs + 1):
@@ -270,13 +272,12 @@ def train(args):
                   f"time {time.time()-t0:.1f}s")
             if val_acc > best:
                 best = val_acc
+                torch.save(ema.module.state_dict(), f"checkpoints/best.pth")
+                print("Best model saved ➜ checkpoints/best.pth")
     except KeyboardInterrupt:
-        Path("checkpoints").mkdir(exist_ok=True)
-        torch.save(ema.module.state_dict(), "checkpoints/interrupted.pth")
-        print("Interrupted, model saved.")
+        print("Training interrupted by user.")
     finally: 
         print(f"Best val acc: {best:.2f}%")
-        print("Interrupted, model saved.")
 
     # ----------- Export ONNX + YAML ----------------
     export_dir = Path("models")
@@ -284,7 +285,7 @@ def train(args):
     onnx_path = str(export_dir/"vit_model.onnx")
     base = ema.module if isinstance(ema, AveragedModel) else ema
     base.eval()
-    dummy = torch.randn(1,3,args.img_size,args.img_size).to(device)
+    dummy = torch.randn(1, 3, args.img_size, args.img_size).to(device)
     torch.onnx.export(base, dummy, onnx_path,
                      input_names=["images"], output_names=["logits"],
                      opset_version=17,
