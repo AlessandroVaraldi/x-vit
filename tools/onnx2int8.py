@@ -137,7 +137,7 @@ def gen_header(cfg: dict,
     # Arena layout
     lines.append(f"#define ARENA_BYTES      {arena['bytes']}")
     for name, off in arena["offsets"].items():
-        lines.append(f"#define ARENA_OFF_{name:<9} {off}")
+        lines.append(f"#define ARENA_OFF_{name:<6} {off}")
     lines.append("")
 
     # Weight/bias offsets (sorted for stability)

@@ -51,15 +51,15 @@ class MHSA(nn.Module):
     def __init__(self, d, h):
         super().__init__()
         self.h = h
-        self.qkv = nn.Linear(d, 3*d, bias=False)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.proj = nn.Linear(d, d)
 
     def forward(self, x):
         B, T, D = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.h, D//self.h).permute(2,0,3,1,4)
+        qkv = self.qkv(x).view(B, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-        return self.proj(y.transpose(1,2).reshape(B, T, D))
+        return self.proj(y.transpose(1, 2).reshape(B, T, D))
 
 class FFN(nn.Module):
     def __init__(self, d, dff, p=0.): 
@@ -69,7 +69,7 @@ class FFN(nn.Module):
         self.act = nn.GELU()
         self.drop = nn.Dropout(p)
 
-    def forward(self,x):
+    def forward(self, x):
         return self.fc2(self.drop(self.act(self.fc1(x))))
 
 class Block(nn.Module):
@@ -350,7 +350,7 @@ if __name__ == "__main__":
     # model
     p.add_argument("--dim", type=int, default=256)
     p.add_argument("--layers", type=int, default=8)
-    p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--heads", type=int, default=8)
     p.add_argument("--dff", type=int, default=512)
     # reg
     p.add_argument("--drop_path", type=float, default=0.1)
